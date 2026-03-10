@@ -1,0 +1,16 @@
+schema_version = "1.0.0"
+
+id = "bone_weight_transfer"
+version = "3.0.0"
+name = "Bone間ウェイト転送アドオン"
+tagline = "ボーン間の頂点ウェイトを転送するアドオン"
+maintainer = "Megane"
+type = "add-on"
+
+tags = ["Rigging"]
+
+blender_version_min = "5.0.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]

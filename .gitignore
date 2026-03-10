@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Blender
+*.blend1
+*.blend2
+*.blend_backup
+__pycache__/
+*.pyc
+*.pyo
+
+# 開発用テスト環境（Blendファイル）
+old/テスト環境.blend
+old/テスト環境.blend1
+
+# エディタ
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
