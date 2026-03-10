@@ -1,45 +1,88 @@
 import bpy
-import re
 from bpy.types import Context
 
 # プロパティの最大数（register時に一括登録）
 MAX_VERTEX_GROUP_PAIRS = 20
 
-# 左右ミラー検出用のパターン定義
-# (正規表現, ミラー先の置換パターン, 元に戻す置換パターン)
-MIRROR_PATTERNS = [
-    # suffix: .L / .R
-    (re.compile(r'^(.+)\.L$', re.IGNORECASE), r'\1.R', r'\1.L'),
-    (re.compile(r'^(.+)\.R$', re.IGNORECASE), r'\1.L', r'\1.R'),
-    # suffix: _L / _R
-    (re.compile(r'^(.+)_L$', re.IGNORECASE), r'\1_R', r'\1_L'),
-    (re.compile(r'^(.+)_R$', re.IGNORECASE), r'\1_L', r'\1_R'),
-    # suffix: _left / _right
-    (re.compile(r'^(.+)_left$', re.IGNORECASE), r'\1_right', r'\1_left'),
-    (re.compile(r'^(.+)_right$', re.IGNORECASE), r'\1_left', r'\1_right'),
-    # suffix: .left / .right
-    (re.compile(r'^(.+)\.left$', re.IGNORECASE), r'\1.right', r'\1.left'),
-    (re.compile(r'^(.+)\.right$', re.IGNORECASE), r'\1.left', r'\1.right'),
-    # prefix: L_ / R_
-    (re.compile(r'^L_(.+)$', re.IGNORECASE), r'R_\1', r'L_\1'),
-    (re.compile(r'^R_(.+)$', re.IGNORECASE), r'L_\1', r'R_\1'),
-    # prefix: Left_ / Right_
-    (re.compile(r'^Left_(.+)$', re.IGNORECASE), r'Right_\1', r'Left_\1'),
-    (re.compile(r'^Right_(.+)$', re.IGNORECASE), r'Left_\1', r'Right_\1'),
+# 左右ミラー検出用のパターン定義 (左側サフィックス/プレフィックス, 右側)
+MIRROR_SUFFIX_PAIRS = [
+    ('.L', '.R'),
+    ('_L', '_R'),
+    ('_left', '_right'),
+    ('.left', '.right'),
 ]
+
+MIRROR_PREFIX_PAIRS = [
+    ('L_', 'R_'),
+    ('Left_', 'Right_'),
+]
+
+
+def _match_case(source, target):
+    """sourceの大文字小文字パターンをtargetに適用する"""
+    if source.isupper():
+        return target.upper()
+    if source.islower():
+        return target.lower()
+    # 先頭だけ大文字などの混合パターン: 文字単位でマッピング
+    result = []
+    for i, ch in enumerate(target):
+        if i < len(source):
+            result.append(ch.upper() if source[i].isupper() else ch.lower())
+        else:
+            result.append(ch)
+    return ''.join(result)
 
 
 def find_mirror_name(name, vg_names):
     """頂点グループ名から左右ミラーの対応名を検索する"""
-    for pattern, replace_to, _replace_from in MIRROR_PATTERNS:
-        m = pattern.match(name)
-        if m:
-            mirror = pattern.sub(replace_to, name)
-            # 大文字小文字を考慮してマッチ
-            for vg in vg_names:
-                if vg.lower() == mirror.lower():
-                    return name, vg
+    name_lower = name.lower()
+    candidate = None
+
+    # サフィックスパターンのチェック
+    for left, right in MIRROR_SUFFIX_PAIRS:
+        if name_lower.endswith(left.lower()):
+            # 元の名前から実際のサフィックス部分を取得し、大文字小文字を保持して置換
+            original_suffix = name[len(name) - len(left):]
+            replacement = _match_case(original_suffix, right)
+            candidate = name[:len(name) - len(left)] + replacement
+            break
+        if name_lower.endswith(right.lower()):
+            original_suffix = name[len(name) - len(right):]
+            replacement = _match_case(original_suffix, left)
+            candidate = name[:len(name) - len(right)] + replacement
+            break
+
+    # プレフィックスパターンのチェック
+    if candidate is None:
+        for left, right in MIRROR_PREFIX_PAIRS:
+            if name_lower.startswith(left.lower()):
+                original_prefix = name[:len(left)]
+                replacement = _match_case(original_prefix, right)
+                candidate = replacement + name[len(left):]
+                break
+            if name_lower.startswith(right.lower()):
+                original_prefix = name[:len(right)]
+                replacement = _match_case(original_prefix, left)
+                candidate = replacement + name[len(right):]
+                break
+
+    if candidate:
+        # 大文字小文字を無視して実際の頂点グループ名を検索
+        for vg in vg_names:
+            if vg.lower() == candidate.lower():
+                return name, vg
+
     return None, None
+
+
+def ensure_pairs(obj, count):
+    """ペアコレクションがちょうど必要な数だけあることを保証する"""
+    pairs = obj.bwt_pairs
+    while len(pairs) < count:
+        pairs.add()
+    while len(pairs) > count:
+        pairs.remove(len(pairs) - 1)
 
 
 # ──────────────────────────────────────────────
@@ -65,22 +108,35 @@ class BWT_OT_transfer_weights(bpy.types.Operator):
             return {'CANCELLED'}
 
         count = settings.pair_count
+        ensure_pairs(obj, count)
         mode = settings.transfer_mode
         success_count = 0
         skip_count = 0
+        error_count = 0
 
         for i in range(count):
-            src = getattr(obj, f"bwt_src_{i}", "")
-            dst = getattr(obj, f"bwt_dst_{i}", "")
+            pair = obj.bwt_pairs[i]
+            src = pair.src
+            dst = pair.dst
 
             if src and dst:
+                # 転送先の頂点グループが存在しない場合は作成
+                if dst not in obj.vertex_groups:
+                    obj.vertex_groups.new(name=dst)
+
                 mod = obj.modifiers.new(name="BWT_Temp", type='VERTEX_WEIGHT_MIX')
                 mod.mix_mode = mode  # 'SET' or 'ADD'
                 mod.mix_set = "B"
+                mod.mask_constant = 1.0  # 全頂点に対して転送を適用
                 mod.vertex_group_a = dst  # コピー先
                 mod.vertex_group_b = src  # コピー元
-                bpy.ops.object.modifier_apply(modifier=mod.name, report=True)
-                success_count += 1
+                try:
+                    bpy.ops.object.modifier_apply(modifier=mod.name, report=True)
+                    success_count += 1
+                except RuntimeError as e:
+                    obj.modifiers.remove(mod)
+                    self.report({'ERROR'}, f"ペア {i + 1} の転送に失敗: {e}")
+                    error_count += 1
             else:
                 skip_count += 1
 
@@ -90,6 +146,8 @@ class BWT_OT_transfer_weights(bpy.types.Operator):
             self.report({'INFO'}, f"{success_count}組のウェイトを転送しました（{mode_label}モード）")
         if skip_count > 0:
             self.report({'WARNING'}, f"{skip_count}組は未設定のためスキップしました")
+        if error_count > 0:
+            self.report({'ERROR'}, f"{error_count}組の転送に失敗しました")
 
         return {'FINISHED'}
 
@@ -107,14 +165,11 @@ class BWT_OT_swap_pair(bpy.types.Operator):
         if not obj:
             return {'CANCELLED'}
 
-        src_attr = f"bwt_src_{self.index}"
-        dst_attr = f"bwt_dst_{self.index}"
-
-        src_val = getattr(obj, src_attr, "")
-        dst_val = getattr(obj, dst_attr, "")
-
-        setattr(obj, src_attr, dst_val)
-        setattr(obj, dst_attr, src_val)
+        ensure_pairs(obj, self.index + 1)
+        pair = obj.bwt_pairs[self.index]
+        tmp = pair.src
+        pair.src = pair.dst
+        pair.dst = tmp
 
         return {'FINISHED'}
 
@@ -131,9 +186,11 @@ class BWT_OT_clear_fields(bpy.types.Operator):
             return {'CANCELLED'}
 
         count = context.scene.bwt_settings.pair_count
+        ensure_pairs(obj, count)
         for i in range(count):
-            setattr(obj, f"bwt_src_{i}", "")
-            setattr(obj, f"bwt_dst_{i}", "")
+            pair = obj.bwt_pairs[i]
+            pair.src = ""
+            pair.dst = ""
 
         self.report({'INFO'}, "選択フィールドをリセットしました")
         return {'FINISHED'}
@@ -194,11 +251,13 @@ class BWT_OT_auto_mirror(bpy.types.Operator):
         # ペア数を検出結果に合わせて更新（上限内で）
         pair_count = min(len(found_pairs), MAX_VERTEX_GROUP_PAIRS)
         settings.pair_count = pair_count
+        ensure_pairs(obj, pair_count)
 
         for i in range(pair_count):
             src, dst = found_pairs[i]
-            setattr(obj, f"bwt_src_{i}", src)
-            setattr(obj, f"bwt_dst_{i}", dst)
+            pair = obj.bwt_pairs[i]
+            pair.src = src
+            pair.dst = dst
 
         self.report({'INFO'}, f"{pair_count}組のミラーペアを検出しました")
         return {'FINISHED'}
@@ -207,6 +266,17 @@ class BWT_OT_auto_mirror(bpy.types.Operator):
 # ──────────────────────────────────────────────
 #  プロパティグループ
 # ──────────────────────────────────────────────
+
+class BWT_PairItem(bpy.types.PropertyGroup):
+    src: bpy.props.StringProperty(
+        name="元",
+        description="コピー元の頂点グループ",
+    )
+    dst: bpy.props.StringProperty(
+        name="先",
+        description="コピー先の頂点グループ",
+    )
+
 
 class BWT_Settings(bpy.types.PropertyGroup):
     pair_count: bpy.props.IntProperty(
@@ -241,7 +311,7 @@ class BWT_PT_main_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        obj = context.object
+        obj = context.active_object
 
         if not obj or obj.type != 'MESH':
             box = layout.box()
@@ -294,7 +364,7 @@ class BWT_PT_pairs_panel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        obj = context.object
+        obj = context.active_object
         settings = context.scene.bwt_settings
 
         if not obj or obj.type != 'MESH':
@@ -309,7 +379,10 @@ class BWT_PT_pairs_panel(bpy.types.Panel):
 
         # 各ペアの表示
         count = settings.pair_count
+        ensure_pairs(obj, count)
+
         for i in range(count):
+            pair = obj.bwt_pairs[i]
             pair_box = layout.box()
 
             # ペア番号ヘッダー
@@ -318,7 +391,7 @@ class BWT_PT_pairs_panel(bpy.types.Panel):
 
             # 元（コピー元）
             pair_box.prop_search(
-                obj, f"bwt_src_{i}",
+                pair, "src",
                 obj, "vertex_groups",
                 text="元",
                 icon='FORWARD',
@@ -332,7 +405,7 @@ class BWT_PT_pairs_panel(bpy.types.Panel):
 
             # 先（コピー先）
             pair_box.prop_search(
-                obj, f"bwt_dst_{i}",
+                pair, "dst",
                 obj, "vertex_groups",
                 text="先",
                 icon='BACK',
@@ -385,6 +458,7 @@ class BWT_PT_actions_panel(bpy.types.Panel):
 # ──────────────────────────────────────────────
 
 classes = (
+    BWT_PairItem,
     BWT_Settings,
     BWT_OT_transfer_weights,
     BWT_OT_swap_pair,
@@ -403,35 +477,11 @@ def register():
         bpy.utils.register_class(cls)
 
     bpy.types.Scene.bwt_settings = bpy.props.PointerProperty(type=BWT_Settings)
-
-    # ペア用プロパティを上限分まとめて登録
-    for i in range(MAX_VERTEX_GROUP_PAIRS):
-        setattr(
-            bpy.types.Object,
-            f"bwt_src_{i}",
-            bpy.props.StringProperty(
-                name=f"元 {i + 1}",
-                description="コピー元の頂点グループ",
-            ),
-        )
-        setattr(
-            bpy.types.Object,
-            f"bwt_dst_{i}",
-            bpy.props.StringProperty(
-                name=f"先 {i + 1}",
-                description="コピー先の頂点グループ",
-            ),
-        )
+    bpy.types.Object.bwt_pairs = bpy.props.CollectionProperty(type=BWT_PairItem)
 
 
 def unregister():
-    for i in range(MAX_VERTEX_GROUP_PAIRS):
-        try:
-            delattr(bpy.types.Object, f"bwt_src_{i}")
-            delattr(bpy.types.Object, f"bwt_dst_{i}")
-        except AttributeError:
-            pass
-
+    del bpy.types.Object.bwt_pairs
     del bpy.types.Scene.bwt_settings
 
     for cls in reversed(classes):
