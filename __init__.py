@@ -4,85 +4,44 @@ from bpy.types import Context
 # プロパティの最大数（register時に一括登録）
 MAX_VERTEX_GROUP_PAIRS = 20
 
-# 左右ミラー検出用のパターン定義 (左側サフィックス/プレフィックス, 右側)
-MIRROR_SUFFIX_PAIRS = [
-    ('.L', '.R'),
-    ('_L', '_R'),
-    ('_left', '_right'),
-    ('.left', '.right'),
-]
 
-MIRROR_PREFIX_PAIRS = [
-    ('L_', 'R_'),
-    ('Left_', 'Right_'),
-]
+MIRROR_SUFFIX_PAIRS = [('.L', '.R'), ('_L', '_R'), ('_left', '_right'), ('.left', '.right')]
+MIRROR_PREFIX_PAIRS = [('L_', 'R_'), ('Left_', 'Right_')]
 
 
-def _match_case(source, target):
-    """sourceの大文字小文字パターンをtargetに適用する"""
-    if source.isupper():
-        return target.upper()
-    if source.islower():
-        return target.lower()
-    # 先頭だけ大文字などの混合パターン: 文字単位でマッピング
-    result = []
-    for i, ch in enumerate(target):
-        if i < len(source):
-            result.append(ch.upper() if source[i].isupper() else ch.lower())
-        else:
-            result.append(ch)
-    return ''.join(result)
-
-
-def find_mirror_name(name, vg_names):
-    """頂点グループ名から左右ミラーの対応名を検索する"""
-    name_lower = name.lower()
-    candidate = None
-
-    # サフィックスパターンのチェック
-    for left, right in MIRROR_SUFFIX_PAIRS:
-        if name_lower.endswith(left.lower()):
-            # 元の名前から実際のサフィックス部分を取得し、大文字小文字を保持して置換
-            original_suffix = name[len(name) - len(left):]
-            replacement = _match_case(original_suffix, right)
-            candidate = name[:len(name) - len(left)] + replacement
-            break
-        if name_lower.endswith(right.lower()):
-            original_suffix = name[len(name) - len(right):]
-            replacement = _match_case(original_suffix, left)
-            candidate = name[:len(name) - len(right)] + replacement
-            break
-
-    # プレフィックスパターンのチェック
-    if candidate is None:
-        for left, right in MIRROR_PREFIX_PAIRS:
-            if name_lower.startswith(left.lower()):
-                original_prefix = name[:len(left)]
-                replacement = _match_case(original_prefix, right)
-                candidate = replacement + name[len(left):]
-                break
-            if name_lower.startswith(right.lower()):
-                original_prefix = name[:len(right)]
-                replacement = _match_case(original_prefix, left)
-                candidate = replacement + name[len(right):]
-                break
-
-    if candidate:
-        # 大文字小文字を無視して実際の頂点グループ名を検索
-        for vg in vg_names:
-            if vg.lower() == candidate.lower():
-                return name, vg
-
-    return None, None
+def flip_lr(name):
+    """名前のL/Rを反転する。対応パターンがなければ空文字を返す"""
+    nl = name.lower()
+    for a, b in MIRROR_SUFFIX_PAIRS:
+        if nl.endswith(a.lower()):
+            return name[:-len(a)] + b
+        if nl.endswith(b.lower()):
+            return name[:-len(b)] + a
+    for a, b in MIRROR_PREFIX_PAIRS:
+        if nl.startswith(a.lower()):
+            return b + name[len(a):]
+        if nl.startswith(b.lower()):
+            return a + name[len(b):]
+    return ""
 
 
 def ensure_pairs(obj, count):
-    """ペアコレクションがちょうど必要な数だけあることを保証する"""
+    """ペアコレクションが count 以上あることを保証する（既存データは削除しない）"""
     pairs = obj.bwt_pairs
     while len(pairs) < count:
         pairs.add()
-    while len(pairs) > count:
-        pairs.remove(len(pairs) - 1)
+
+
+def _deferred_ensure_pairs(obj_name, count):
+    """draw()の外でペアを初期化し、再描画をトリガーする"""
+    obj = bpy.data.objects.get(obj_name)
+    if obj and len(obj.bwt_pairs) < count:
+        ensure_pairs(obj, count)
+        for window in bpy.context.window_manager.windows:
+            for area in window.screen.areas:
+                if area.type == 'VIEW_3D':
+                    area.tag_redraw()
+    return None  # タイマーを繰り返さない
 
 
 # ──────────────────────────────────────────────
@@ -110,9 +69,11 @@ class BWT_OT_transfer_weights(bpy.types.Operator):
         count = settings.pair_count
         ensure_pairs(obj, count)
         mode = settings.transfer_mode
+        delete_source = settings.delete_source
         success_count = 0
         skip_count = 0
         error_count = 0
+        transferred_srcs = []
 
         for i in range(count):
             pair = obj.bwt_pairs[i]
@@ -133,6 +94,7 @@ class BWT_OT_transfer_weights(bpy.types.Operator):
                 try:
                     bpy.ops.object.modifier_apply(modifier=mod.name, report=True)
                     success_count += 1
+                    transferred_srcs.append(src)
                 except RuntimeError as e:
                     obj.modifiers.remove(mod)
                     self.report({'ERROR'}, f"ペア {i + 1} の転送に失敗: {e}")
@@ -140,10 +102,18 @@ class BWT_OT_transfer_weights(bpy.types.Operator):
             else:
                 skip_count += 1
 
+        # 転送元の削除
+        if delete_source and transferred_srcs:
+            for src_name in transferred_srcs:
+                vg = obj.vertex_groups.get(src_name)
+                if vg:
+                    obj.vertex_groups.remove(vg)
+
         # 結果レポート
         if success_count > 0:
             mode_label = "上書き" if mode == 'SET' else "加算"
-            self.report({'INFO'}, f"{success_count}組のウェイトを転送しました（{mode_label}モード）")
+            delete_label = "（転送元を削除）" if delete_source else ""
+            self.report({'INFO'}, f"{success_count}組のウェイトを転送しました（{mode_label}モード）{delete_label}")
         if skip_count > 0:
             self.report({'WARNING'}, f"{skip_count}組は未設定のためスキップしました")
         if error_count > 0:
@@ -215,51 +185,52 @@ class BWT_OT_delete_all_vertex_groups(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class BWT_OT_auto_mirror(bpy.types.Operator):
-    """左右ミラーの命名規則（.L/.R, _L/_R 等）から対応ペアを自動検出"""
-    bl_idname = "bwt.auto_mirror"
-    bl_label = "左右ミラーを自動検出"
+class BWT_OT_add_mirror_pair(bpy.types.Operator):
+    """元と先の名前をL/R反転した新しいペアを追加する"""
+    bl_idname = "bwt.add_mirror_pair"
+    bl_label = "LR反転ペアを追加"
     bl_options = {'REGISTER', 'UNDO'}
+
+    index: bpy.props.IntProperty()
 
     def execute(self, context: Context):
         obj = context.active_object
         settings = context.scene.bwt_settings
 
-        if not obj or obj.type != 'MESH' or not obj.vertex_groups:
-            self.report({'ERROR'}, "メッシュオブジェクトまたは頂点グループがありません")
+        ensure_pairs(obj, self.index + 1)
+        pair = obj.bwt_pairs[self.index]
+
+        if not pair.src and not pair.dst:
+            self.report({'WARNING'}, "元と先が未設定です")
             return {'CANCELLED'}
 
-        vg_names = [vg.name for vg in obj.vertex_groups]
-        found_pairs = []
-        used = set()
+        new_src = flip_lr(pair.src) if pair.src else ""
+        new_dst = flip_lr(pair.dst) if pair.dst else ""
 
-        for name in vg_names:
-            if name in used:
-                continue
-            src, dst = find_mirror_name(name, vg_names)
-            if src and dst and src != dst and dst not in used:
-                found_pairs.append((src, dst))
-                used.add(src)
-                used.add(dst)
-
-        if not found_pairs:
-            self.report({'WARNING'},
-                        "ミラーペアが見つかりませんでした "
-                        "（対応する命名規則: .L/.R, _L/_R, _left/_right 等）")
+        if not new_src and not new_dst:
+            self.report({'WARNING'}, "L/Rパターンが見つかりませんでした（.L/.R, _L/_R 等が必要です）")
             return {'CANCELLED'}
 
-        # ペア数を検出結果に合わせて更新（上限内で）
-        pair_count = min(len(found_pairs), MAX_VERTEX_GROUP_PAIRS)
-        settings.pair_count = pair_count
-        ensure_pairs(obj, pair_count)
+        # 次の空きスロットを探す、なければ末尾に追加
+        count = settings.pair_count
+        ensure_pairs(obj, count)
+        new_index = next(
+            (i for i in range(count) if not obj.bwt_pairs[i].src and not obj.bwt_pairs[i].dst),
+            None,
+        )
+        if new_index is None:
+            if count >= MAX_VERTEX_GROUP_PAIRS:
+                self.report({'WARNING'}, f"ペアが上限（{MAX_VERTEX_GROUP_PAIRS}）に達しています")
+                return {'CANCELLED'}
+            new_index = count
+            settings.pair_count = count + 1
+            ensure_pairs(obj, count + 1)
 
-        for i in range(pair_count):
-            src, dst = found_pairs[i]
-            pair = obj.bwt_pairs[i]
-            pair.src = src
-            pair.dst = dst
+        new_pair = obj.bwt_pairs[new_index]
+        new_pair.src = new_src
+        new_pair.dst = new_dst
 
-        self.report({'INFO'}, f"{pair_count}組のミラーペアを検出しました")
+        self.report({'INFO'}, f"LR反転ペアをペア {new_index + 1} に追加しました")
         return {'FINISHED'}
 
 
@@ -294,6 +265,11 @@ class BWT_Settings(bpy.types.PropertyGroup):
             ('ADD', "加算", "コピー先の既存ウェイトに元のウェイトを加算します"),
         ],
         default='SET',
+    )
+    delete_source: bpy.props.BoolProperty(
+        name="転送後に転送元を削除",
+        description="転送完了後、転送元の頂点グループを削除します",
+        default=False,
     )
 
 
@@ -352,6 +328,9 @@ class BWT_PT_settings_panel(bpy.types.Panel):
         row.prop_enum(settings, "transfer_mode", 'SET')
         row.prop_enum(settings, "transfer_mode", 'ADD')
 
+        col.separator(factor=0.5)
+        col.prop(settings, "delete_source")
+
 
 class BWT_PT_pairs_panel(bpy.types.Panel):
     """ペア設定サブパネル"""
@@ -370,16 +349,16 @@ class BWT_PT_pairs_panel(bpy.types.Panel):
         if not obj or obj.type != 'MESH':
             return
 
-        # 自動検出ボタン
-        auto_row = layout.row()
-        auto_row.scale_y = 1.2
-        auto_row.operator("bwt.auto_mirror", text="左右ミラー自動検出", icon='MOD_MIRROR')
-
-        layout.separator(factor=0.3)
-
         # 各ペアの表示
         count = settings.pair_count
-        ensure_pairs(obj, count)
+
+        # draw()内でのデータ変更は禁止されているため、不足時はタイマーで遅延初期化
+        if len(obj.bwt_pairs) < count:
+            bpy.app.timers.register(
+                lambda: _deferred_ensure_pairs(obj.name, count),
+                first_interval=0.0,
+            )
+            return
 
         for i in range(count):
             pair = obj.bwt_pairs[i]
@@ -397,10 +376,12 @@ class BWT_PT_pairs_panel(bpy.types.Panel):
                 icon='FORWARD',
             )
 
-            # スワップボタン（中央配置）
-            swap_row = pair_box.row()
-            swap_row.alignment = 'CENTER'
-            op = swap_row.operator("bwt.swap_pair", text="入れ替え", icon='FILE_REFRESH')
+            # 操作ボタン（中央配置）
+            btn_row = pair_box.row(align=True)
+            btn_row.alignment = 'CENTER'
+            op = btn_row.operator("bwt.swap_pair", text="入れ替え", icon='FILE_REFRESH')
+            op.index = i
+            op = btn_row.operator("bwt.add_mirror_pair", text="LR反転追加", icon='MOD_MIRROR')
             op.index = i
 
             # 先（コピー先）
@@ -462,9 +443,9 @@ classes = (
     BWT_Settings,
     BWT_OT_transfer_weights,
     BWT_OT_swap_pair,
+    BWT_OT_add_mirror_pair,
     BWT_OT_clear_fields,
     BWT_OT_delete_all_vertex_groups,
-    BWT_OT_auto_mirror,
     BWT_PT_main_panel,
     BWT_PT_settings_panel,
     BWT_PT_pairs_panel,
